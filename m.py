@@ -29,57 +29,81 @@ def gate(frame: int, bps: int, frame_len: int, click_avoid=0):
     return 0
 
 def count_to(frame: int, bps: int, up_to: int):
-    return 1 + ((frame // (FRAMES_PER_SECOND // bps)) % up_to)
+    return (frame // (FRAMES_PER_SECOND // bps)) % up_to
     
 def mtf(_frame: int, midi: int):
     return 440 * 2 ** ((midi - 69) / 12)
-    
-s = """
-4 metro 'myTrigger set
 
-
-  'myCounter get
-  'myTrigger get
-   +
-  'myCounter set
-
-  'myCounter get
-   2
-   == 1 'otherTrigger set
-
-'myTrigger get
-  2 triggerEvery 'myTriggerDouble set
-
-440 ( 4 8820 gate ) 64 * sine
-550 ( 3 8820 gate ) 100 * sine
-+ 2 /
-"""
+# def envelope(frame: int, env: dict, last_trigger: int,
+#              attack: int, sustain: int, decay: int):
+#     if trigger == 1:
+#         env[]
 
 s = """
+;; Esempio di variable
+60 'myConst set
+
+;; Esempio di variabile di tipo lista
+[ 69 70 'myConst 71 70 ] 'myList set
+
+;; Analogo a range(0, 5) in python, cambia ogni 1/8 di secondo
+8 5 countTo 'myIdx set
+
+;; Genera sine con pitch preso dalla lista
+( 'myList get
+  'myIdx get nth ) mtf 96 sine
+
+;; Genera seconda sine
 440 ( 4 8820 gate ) 64 * sine
-( 6 5 countTo 73 + mtf ) 96 sine
+
+
+;; Genera terza sine con inviluppo 
+;;  5 metro
+;;    1000 1 200 linenv
+;; 'myEnvelope set
+
+;; 440 ( 'myEnvelope get ) 96 * sine
+
+;; Mixa le due sine
 + 2 /
 """
 
 def tokenize(program: str):
-    tokens = s.replace("\n", " ").split(" ")
+    no_comments = [line for line in program.split("\n") if not line.startswith(";;")]
+    
+    tokens = " ".join(no_comments).split(" ")
     return tokens
 
+def parse_list(tokens: list, env: dict):
+    l = list()
+    while (token := tokens.pop(0)) != "]":
+        if token.isnumeric():
+            l.append(float(token))
+        elif token.startswith("'"):
+            l.append(env["vars"].get(token, 0))
+        else:
+            raise Exception(f"Non valido per lista: {token}")
+    return l
 
 def interpreter(program: str, frame: int, env: dict):
     stack = list()
     tokens = tokenize(program)
-    for token in tokenize(program):
+    while len(tokens) > 0:
+    # for token in tokenize(program):
+        token = tokens.pop(0)
+        
         if token.isnumeric():
             stack.append(float(token))
         elif token in "()":
-            continue
+            continue    
         elif token.startswith("'"):
             stack.append(token)
         elif token == "sine":
             amplitude = stack.pop()
             frequency = stack.pop()
             stack.append(sine_wave(frame, frequency, amplitude))
+        elif token == "[":
+            stack.append(parse_list(tokens, env))
         elif token == "+":
             stack.append(stack.pop() + stack.pop())
         elif token == "*":
@@ -104,6 +128,10 @@ def interpreter(program: str, frame: int, env: dict):
             stack.append(count_to(frame, bps, up_to))
         elif token == "mtf":
             stack.append(mtf(frame, stack.pop()))
+        elif token == "nth":
+            idx = round(stack.pop())
+            lst = stack.pop() # TODO: pop o get?
+            stack.append(lst[idx])
         else:
             raise Exception(f"not found: {token}")
             
@@ -113,7 +141,8 @@ def interpreter(program: str, frame: int, env: dict):
 def generate_frames(program: str, seconds: int):
     env = {
         "vars" : {},
-        "triggers": {}
+        "triggers": {},
+        "tracks": {}
     }
     for frame in range(0, int(FRAMES_PER_SECOND * seconds)):
         yield interpreter(program, frame, env)
@@ -130,7 +159,7 @@ with wave.open("output.wav", mode="wb") as wav_file:
     wav_file.setsampwidth(1)
     wav_file.setframerate(FRAMES_PER_SECOND)
     # wav_file.writeframes(bytes(sound_wave(440, 2.5)))
-    wav_file.writeframes(bytes(generate_frames(s, 8)))
+    wav_file.writeframes(bytes(generate_frames(s, 4)))
 
 import subprocess
 subprocess.run("aplay output.wav", shell=True)
