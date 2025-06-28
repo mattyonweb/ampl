@@ -4,6 +4,19 @@ import wave
 
 FRAMES_PER_SECOND = 44100
 
+
+class Trigger(int):
+    def __new__(cls, frame, value):
+        obj = super().__new__(cls, value)
+        obj.frame = frame
+        return obj
+
+    def __eq__(self, other):
+        if isinstance(other, Trigger):
+            return int(self) == int(other) and self.frame == other.frame
+        return int(self) == other
+
+    
 def clip(x):
     if x >= 256:
         print(x)
@@ -21,14 +34,39 @@ def sine_wave(frame: int, frequency: float, amplitude: float):
 def noise(_frame: int, amplitude: float):
     return round(random.random() * amplitude)
 
-def metro(frame: int, bps: int):
+def metro(frame: int, bps: int, unique_id: int, env: dict):
+    if frame % (FRAMES_PER_SECOND // bps) == 0:
+
+        trigger = Trigger(frame, 1)
+        env["triggers"][unique_id] = trigger
+
+        return trigger
+
+    if (t := env["triggers"].get(unique_id, None)) is not None:
+        if t != 0:
+            t = Trigger(frame, 0)
+            env["triggers"][unique_id] = t
+        return t
+
+    return Trigger(-1, 0)
+
+
+def metro_stateless(frame: int, bps: int):
     if frame % (FRAMES_PER_SECOND // bps) == 0:
         return 1
     return 0
 
-def gate(frame: int, every_x_frame: int, frame_len: int):
+
+def gate_stateless(frame: int, every_x_frame: int, frame_len: int):
     rem = frame % every_x_frame
     if rem < frame_len:
+        return 1
+    return 0
+
+def gate(frame: int, frame_len: int, trigger: Trigger):
+    if trigger == 1:
+        return 1
+    if frame < trigger.frame + frame_len:
         return 1
     return 0
 
@@ -38,6 +76,16 @@ def count_to(frame: int, every_x_frames: int, up_to: int):
 def mtf(_frame: int, midi: int):
     return round(440 * 2 ** ((midi - 69) / 12))
 
+def env_asr(frame: int, trigger: Trigger, atk: int, sus: float, rel: int):
+    start = trigger.frame
+
+    if frame > start + atk + rel:
+        return 0
+
+    if frame < start + atk:
+        return sus * ((frame - start) / atk)
+
+    return sus * (1 - (frame - start - atk) / rel)
 
 s = """
 ;; Esempio di variable
@@ -111,6 +159,37 @@ s = """
 
 4 /
 """
+
+s = """
+3 metro 'myTrigger set
+4 metro 'myTrigger2 set
+5 metro 'myTrigger3 set
+
+;; 'myTrigger get  8192 gate 'myGate set
+
+'myTrigger get
+  64 1 4410 env_asr
+  'myEnv set
+
+'myTrigger2 get
+  64 1 4410 env_asr
+  'myEnv2 set
+
+ 'myTrigger3 get
+   64 1 4410 env_asr
+   'myEnv3 set
+
+;; print_trig
+
+880 ( 128 'myEnv get * ) sine
+
+550 ( 255 'myEnv2 get * ) sine
+
+1440 ( 128 'myEnv3 get * ) sine
+
++ + 3 /
+"""
+
 def tokenize(program: str):
     tokens = list()
     
@@ -146,7 +225,7 @@ def optimize_tokens(tokens: list):
     out_tokens = list()
     i = 0
     
-    while i <= len(tokens) - 3:
+    while i <= len(tokens) - 1:
         if tokens[i].isnumeric() and tokens[i+1].isnumeric() and tokens[i+2] == "sine":
             out_tokens.append(
                 Const(sine_wave, float(tokens[i]), float(tokens[i+1]))
@@ -162,15 +241,15 @@ def optimize_tokens(tokens: list):
 def compiler(program: str, env: dict):
     tokens_raw = tokenize(program)
     tokens = optimize_tokens(tokens_raw)
-    # tokens = tokens_raw
+
     test_out = list()
+    unique_id = 0
     
     while len(tokens) > 0:
         token = tokens.pop(0)
-
+        unique_id += 1
         
         if isinstance(token, Const):
-            
             funcall = token.funcall
             args    = token.args
             def inner(frame, env, stack, funcall=funcall, args=args):
@@ -183,11 +262,7 @@ def compiler(program: str, env: dict):
                 stack.append(val)
             test_out.append(inner)
 
-        elif token in "()":
-            continue    
-
         elif token.startswith("'"):
-            # stack.append(token)
             v = token
             def inner(frame, env, stack, val=v):
                 stack.append(val)
@@ -200,6 +275,11 @@ def compiler(program: str, env: dict):
                 r = sine_wave(frame, frequency, amplitude)
                 stack.append(r)
             test_out.append(custom_sine)
+
+        elif token == "print_trig":
+            def inner(frame, env, stack):
+                print(env["triggers"])
+            test_out.append(inner)
 
         elif token == "[":
             # BUG: in caso di lettura di variabili ovviamente non va bene!
@@ -230,9 +310,9 @@ def compiler(program: str, env: dict):
         elif token == "gate":
             def inner(frame, env, stack):    
                 frame_len = int(stack.pop())
-                bps = int(stack.pop())
+                trigger: Trigger = stack.pop()
                 stack.append(gate(
-                    frame, FRAMES_PER_SECOND // bps, frame_len
+                    frame, frame_len, trigger
                 ))
             test_out.append(inner)
             
@@ -246,9 +326,9 @@ def compiler(program: str, env: dict):
         elif token == "get":
             def inner(frame, env, stack):    
                 name = stack.pop()
-                stack.append(env["vars"].get(name, 0))
+                stack.append(env["vars"][name])
             test_out.append(inner)
-            
+
         elif token == "countTo":
             def inner(frame, env, stack):    
                 up_to = stack.pop()
@@ -267,6 +347,27 @@ def compiler(program: str, env: dict):
                 lst = stack.pop() # TODO: pop o get?
                 stack.append(lst[idx])
             test_out.append(inner)
+
+        elif token == "metro":
+            def inner(frame, env, stack, unique_id=unique_id):
+                bps = stack.pop()
+                stack.append(metro(frame, bps, unique_id, env))
+            test_out.append(inner)
+
+        elif token == "env_asr":
+            def inner(frame, env, stack):
+                rel = stack.pop()
+                sus = float(stack.pop())
+                atk = stack.pop()
+                trigger = stack.pop()
+                stack.append(env_asr(frame, trigger, atk, sus, rel))
+            test_out.append(inner)
+
+        elif token == "print":
+            def inner(frame, env, stack):
+                print(f"F{frame}", stack)
+            test_out.append(inner)
+
         else:
             raise Exception(f"not found: {token}")
 
@@ -277,7 +378,8 @@ def interpreter(functions, frame, env):
     stack = list()
     for func in functions:
         func(frame, env, stack)
-    r = stack.pop()
+    r = int(stack.pop())
+    # print(r)
     return r
 
 def generate_frames(program: str, seconds: int):
@@ -293,13 +395,14 @@ def generate_frames(program: str, seconds: int):
         yield interpreter(functions, frame, env)
     print(time.time() - start)
 
-        
-with wave.open("output.wav", mode="wb") as wav_file:
-    wav_file.setnchannels(1)
-    wav_file.setsampwidth(1)
-    wav_file.setframerate(FRAMES_PER_SECOND)
-    # wav_file.writeframes(bytes(sound_wave(440, 2.5)))
-    wav_file.writeframes(bytes(generate_frames(s, 8)))
+# if __name__ == "__main__":        
+if 1 == 1:
+    with wave.open("output.wav", mode="wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(1)
+        wav_file.setframerate(FRAMES_PER_SECOND)
+        # wav_file.writeframes(bytes(sound_wave(440, 2.5)))
+        wav_file.writeframes(bytes(generate_frames(s, 4)))
 
-import subprocess
-subprocess.run("aplay output.wav", shell=True)
+    import subprocess
+    subprocess.run("aplay output.wav", shell=True)
