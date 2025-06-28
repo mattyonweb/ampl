@@ -1,6 +1,7 @@
 from typing import *
 import math
 import wave
+import dataclasses
 
 FRAMES_PER_SECOND = 44100
 
@@ -26,10 +27,31 @@ def clip(x):
         return 0
     return x
 
+# =========================================================== #
+# =========================================================== #
+
 def sine_wave(frame: int, frequency: float, amplitude: float):
     time = frame / FRAMES_PER_SECOND
     w    = math.sin(2 * math.pi * frequency * time)
     return clip(round(amplitude * (w+1) / 2))
+
+
+def sine_wave_optcheck(tokens: list[Any]) -> tuple[Any, int]:
+    if len(tokens) < 3:
+        return None, 1
+    
+    freq, amplitude, funcname, *rest = tokens
+
+    if funcname == "sine":
+        if isinstance(freq, str) and isinstance(amplitude, str):
+            if freq.isnumeric() and amplitude.isnumeric():
+                f = lambda fr,env,stack: sine_wave(
+                    fr, int(freq), int(amplitude)
+                )
+                return f, 3
+    return None, 1
+
+# =========================================================== #
 
 def noise(_frame: int, amplitude: float):
     return round(random.random() * amplitude)
@@ -38,30 +60,17 @@ def metro(frame: int, bps: int, unique_id: int, env: dict):
     if frame % (FRAMES_PER_SECOND // bps) == 0:
 
         trigger = Trigger(frame, 1)
-        env["triggers"][unique_id] = trigger
-
+        env.triggers[unique_id] = trigger
         return trigger
 
-    if (t := env["triggers"].get(unique_id, None)) is not None:
+    if (t := env.triggers.get(unique_id, None)) is not None:
         if t != 0:
             t = Trigger(frame, 0)
-            env["triggers"][unique_id] = t
+            env.triggers[unique_id] = t
         return t
 
     return Trigger(-1, 0)
 
-
-def metro_stateless(frame: int, bps: int):
-    if frame % (FRAMES_PER_SECOND // bps) == 0:
-        return 1
-    return 0
-
-
-def gate_stateless(frame: int, every_x_frame: int, frame_len: int):
-    rem = frame % every_x_frame
-    if rem < frame_len:
-        return 1
-    return 0
 
 def gate(frame: int, frame_len: int, trigger: Trigger):
     if trigger == 1:
@@ -76,6 +85,8 @@ def count_to(frame: int, every_x_frames: int, up_to: int):
 def mtf(_frame: int, midi: int):
     return round(440 * 2 ** ((midi - 69) / 12))
 
+# =========================================================== #
+
 def env_asr(frame: int, trigger: Trigger, atk: int, sus: float, rel: int):
     start = trigger.frame
 
@@ -86,6 +97,26 @@ def env_asr(frame: int, trigger: Trigger, atk: int, sus: float, rel: int):
         return sus * ((frame - start) / atk)
 
     return sus * (1 - (frame - start - atk) / rel)
+
+def env_asr_optcheck(tokens: list[Any]) -> tuple[Any, int]:
+    if len(tokens) < 4:
+        return None, 1
+    
+    atk, sus, rel, funcname, *rest = tokens
+    if funcname == "env_asr":
+        if isinstance(atk, str) and isinstance(sus, str) and isinstance(rel, str):
+            if atk.isnumeric() and sus.isnumeric() and rel.isnumeric():
+                atk, sus, rel = int(atk), float(sus), int(rel)
+                def inner(fr, env, stack, atk=atk, sus=sus, rel=rel):
+                    stack.append(
+                        env_asr(fr, stack.pop(), atk, sus, rel)
+                    )
+                return inner, 4
+    return None, 1
+
+
+# =========================================================== #
+# =========================================================== #
 
 s = """
 ;; Esempio di variable
@@ -165,8 +196,6 @@ s = """
 4 metro 'myTrigger2 set
 5 metro 'myTrigger3 set
 
-;; 'myTrigger get  8192 gate 'myGate set
-
 'myTrigger get
   64 1 4410 env_asr
   'myEnv set
@@ -215,33 +244,51 @@ def parse_list(tokens: list, env: dict):
             raise Exception(f"Non valido per lista: {token}")
     return l
 
-class Const:
-    def __init__(self, funcall, *args):
-        self.funcall = funcall
-        self.args = args
 
 def optimize_tokens(tokens: list):
-    mask = ("<num>", "<num>", "sine")
     out_tokens = list()
     i = 0
-    
-    while i <= len(tokens) - 1:
-        if tokens[i].isnumeric() and tokens[i+1].isnumeric() and tokens[i+2] == "sine":
-            out_tokens.append(
-                Const(sine_wave, float(tokens[i]), float(tokens[i+1]))
-            )
-            i = i + 3
-        else:
-            out_tokens.append(tokens[i])
-            i = i + 1
 
+    while i < len(tokens):
+        special_sub, increment = sine_wave_optcheck(tokens[i:])
+        if special_sub is None:
+            out_tokens.append(tokens[i])
+            i += 1
+        else:
+            out_tokens.append(special_sub)
+            i += increment
+
+    # =========================================================== #
+    
+    tokens = out_tokens
+    out_tokens = list()
+    i = 0
+
+    while i < len(tokens):
+        special_sub, increment = env_asr_optcheck(tokens[i:])
+        if special_sub is None:
+            out_tokens.append(tokens[i])
+            i += 1
+        else:
+            out_tokens.append(special_sub)
+            i += increment
+        
     return out_tokens
 
+@dataclasses.dataclass
+class Env:
+    triggers: dict[int, Trigger]
+    variables: list[Any]
+    
 
 def compiler(program: str, env: dict):
     tokens_raw = tokenize(program)
     tokens = optimize_tokens(tokens_raw)
 
+    print(tokens)
+    
+    symbol_to_id = dict()
+    
     test_out = list()
     unique_id = 0
     
@@ -252,11 +299,15 @@ def compiler(program: str, env: dict):
         if isinstance(token, Const):
             funcall = token.funcall
             args    = token.args
+            
             def inner(frame, env, stack, funcall=funcall, args=args):
                 stack.append(funcall(frame, *args))
             test_out.append(inner)
+
+        elif isinstance(token, Callable):
+            test_out.append(token)
             
-        if token.isnumeric():
+        elif token.isnumeric():
             v = float(token)
             def inner(frame, env, stack, val=v):
                 stack.append(val)
@@ -264,8 +315,19 @@ def compiler(program: str, env: dict):
 
         elif token.startswith("'"):
             v = token
-            def inner(frame, env, stack, val=v):
+            enlarge_varlist = False
+            
+            if v in symbol_to_id:
+                v = symbol_to_id[v]
+            else:
+                symbol_to_id[v] = len(symbol_to_id)
+                v = symbol_to_id[v]
+                enlarge_varlist = True
+                
+            def inner(frame, env, stack, val=v, enlarge=enlarge_varlist):
                 stack.append(val)
+                if enlarge:
+                    env.variables.append(None)
             test_out.append(inner)
 
         elif token == "sine":
@@ -276,9 +338,14 @@ def compiler(program: str, env: dict):
                 stack.append(r)
             test_out.append(custom_sine)
 
+        elif token == "rand":
+            def inner(frame, env, stack):
+                stack.append(random.random())
+            test_out.append(inner)
+
         elif token == "print_trig":
             def inner(frame, env, stack):
-                print(env["triggers"])
+                print(env.triggers)
             test_out.append(inner)
 
         elif token == "[":
@@ -318,15 +385,15 @@ def compiler(program: str, env: dict):
             
         elif token == "set":
             def inner(frame, env, stack):    
-                name  = stack.pop()
-                value = stack.pop()
-                env["vars"][name] = value
+                name_id: int = stack.pop()
+                value        = stack.pop()
+                env.variables[name_id] = value
             test_out.append(inner)
             
         elif token == "get":
             def inner(frame, env, stack):    
-                name = stack.pop()
-                stack.append(env["vars"][name])
+                name_id: int = stack.pop()
+                stack.append(env.variables[name_id])
             test_out.append(inner)
 
         elif token == "countTo":
@@ -383,11 +450,8 @@ def interpreter(functions, frame, env):
     return r
 
 def generate_frames(program: str, seconds: int):
-    env = {
-        "vars" : {},
-        "triggers": {},
-        "tracks": {}
-    }
+    env = Env({}, [])
+    
     import time
     start = time.time()
     functions = compiler(program, env)    
