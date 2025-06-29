@@ -4,12 +4,13 @@ import wave
 import dataclasses
 
 FRAMES_PER_SECOND = 44100
-
+INV_FRAMES_PER_SECOND = 1 / FRAMES_PER_SECOND
 
 class Trigger(int):
-    def __new__(cls, frame, value):
+    def __new__(cls, frame, value, counter=0):
         obj = super().__new__(cls, value)
-        obj.frame = frame
+        obj.frame   = frame
+        obj.counter = counter
         return obj
 
     def __eq__(self, other):
@@ -27,12 +28,23 @@ def clip(x):
         return 0
     return x
 
+MIDI_INACCURATE = [8, 9, 9, 10, 10, 11, 12, 12, 13, 14, 15, 15, 16, 17, 18, 19, 21, 22, 23, 24, 26, 28, 29, 31, 33, 35, 37, 39, 41, 44, 46, 49, 52, 55, 58, 62, 65, 69, 73, 78, 82, 87, 92, 98, 104, 110, 117, 123, 131, 139, 147, 156, 165, 175, 185, 196, 208, 220, 233, 247, 262, 277, 294, 311, 330, 349, 370, 392, 415, 440, 466, 494, 523, 554, 587, 622, 659, 698, 740, 784, 831, 880, 932, 988, 1047, 1109, 1175, 1245, 1319, 1397, 1480, 1568, 1661, 1760, 1865, 1976, 2093, 2217, 2349, 2489, 2637, 2794, 2960, 3136, 3322, 3520, 3729, 3951, 4186, 4435, 4699, 4978, 5274, 5588, 5920, 6272, 6645, 7040, 7459, 7902, 8372, 8870, 9397, 9956, 10548, 11175, 11840, 12544]
+
+PIPI = 2 * math.pi
+
+
+def float_or_int(s: str) -> bool:
+    # BUG: es. "123.456.678"
+    return s.replace(".", "").isnumeric()
+    
 # =========================================================== #
 # =========================================================== #
 
 def sine_wave(frame: int, frequency: float, amplitude: float):
-    time = frame / FRAMES_PER_SECOND
-    w    = math.sin(2 * math.pi * frequency * time)
+    # time = frame
+    time = frame * INV_FRAMES_PER_SECOND
+    # w    = math.sin(2 * math.pi * frequency * time)
+    w    = math.sin(6.28 * frequency * time)
     return clip(round(amplitude * (w+1) / 2))
 
 
@@ -45,9 +57,9 @@ def sine_wave_optcheck(tokens: list[Any]) -> tuple[Any, int]:
     if funcname == "sine":
         if isinstance(freq, str) and isinstance(amplitude, str):
             if freq.isnumeric() and amplitude.isnumeric():
-                f = lambda fr,env,stack: sine_wave(
+                f = lambda fr,env,stack: stack.append(sine_wave(
                     fr, int(freq), int(amplitude)
-                )
+                ))
                 return f, 3
     return None, 1
 
@@ -59,7 +71,14 @@ def noise(_frame: int, amplitude: float):
 def metro(frame: int, bps: int, unique_id: int, env: dict):
     if frame % (FRAMES_PER_SECOND // bps) == 0:
 
-        trigger = Trigger(frame, 1)
+        trigger = env.triggers.get(unique_id, None)
+
+        if trigger is None:
+            trigger = Trigger(frame, 1)
+        else:
+            trigger.frame = frame
+            trigger.counter += 1
+            
         env.triggers[unique_id] = trigger
         return trigger
 
@@ -79,11 +98,43 @@ def gate(frame: int, frame_len: int, trigger: Trigger):
         return 1
     return 0
 
-def count_to(frame: int, every_x_frames: int, up_to: int):
+def count_to_old(frame: int, every_x_frames: int, up_to: int):
     return (frame // every_x_frames) % up_to
-    
+
+def count_to(frame: int, trigger: Trigger, start: int, end: int):
+    return start + (trigger.counter % (end - start + 1)) 
+
+# =========================================================== #
+
 def mtf(_frame: int, midi: int):
-    return round(440 * 2 ** ((midi - 69) / 12))
+    return MIDI_INACCURATE[midi]
+    # return 440 * 2 ** ((midi - 69) / 12)
+
+def mtf_optcheck(tokens: list[Any]) -> tuple[Any, int]:
+    if len(tokens) < 2:
+        return None, 1
+    
+    arg, funcname, *rest = tokens
+    if funcname == "mtf":
+        if isinstance(arg, str) and arg.isnumeric():
+            arg = int(arg)
+            return str(mtf(None, arg)), 2
+            # def inner(fr, env, stack, arg=arg):
+            #     stack.append(mtf(None, arg))
+            # return inner, 2
+    return None, 1
+
+# =========================================================== #
+
+# TODO: sequenze di numeri e/o operazioni artimetiche vengono compresse
+def math_take_until(tokens) -> list:
+    ...
+    
+def generic_math_optcheck(tokens: list[Any]) -> tuple[Any, int]:
+    operators = ["+", "-", "*", "/"]
+    if not (tokens[0] in operators or float_or_int(tokens[0])):
+        return None, 1
+    ...
 
 # =========================================================== #
 
@@ -105,7 +156,7 @@ def env_asr_optcheck(tokens: list[Any]) -> tuple[Any, int]:
     atk, sus, rel, funcname, *rest = tokens
     if funcname == "env_asr":
         if isinstance(atk, str) and isinstance(sus, str) and isinstance(rel, str):
-            if atk.isnumeric() and sus.isnumeric() and rel.isnumeric():
+            if atk.isnumeric() and sus.replace(".", "").isnumeric() and rel.isnumeric():
                 atk, sus, rel = int(atk), float(sus), int(rel)
                 def inner(fr, env, stack, atk=atk, sus=sus, rel=rel):
                     stack.append(
@@ -183,13 +234,6 @@ s = """
 
 """
 
-s = """
-10 24 countTo 'myIdx set
-
-71 ( 'myIdx get ) - mtf 96 sine
-
-4 /
-"""
 
 s = """
 3 metro 'myTrigger set
@@ -219,6 +263,61 @@ s = """
 + + 3 /
 """
 
+s = """
+;; Esempio di variable
+60 'myConst set
+
+;; Esempio di variabile di tipo lista
+[ 69 70 71 72 73 ] 'myList set
+
+;; Analogo a range(0, 5) in python, cambia ogni 1/8 di secondo
+8 5 countTo 'myIdx set  
+
+;; Genera sine con pitch preso dalla lista
+( 'myList get
+  'myIdx get nth ) mtf 96 sine
+
+
+;; Genera seconda sine
+50 mtf ( 4 metro 64 1 4410 env_asr ) 96 * sine
+
++ 2 /
+"""
+
+s = """
+;; Esempio di variable
+70 'myConst set
+
+4 metro dup
+
+'myConst get 73 count_to
+  'pitch set
+
+61 1 4410 env_asr
+  'myEnv set
+
+'pitch get mtf ( 'myEnv get 128 * ) sine
+
+
+
+5 metro dup
+'myConst get 73 count_to 16 +
+  'pitch2 set
+1000 1 500 env_asr
+  'myEnv2 set
+'pitch2 get mtf ( 'myEnv2 get 128 * ) sine
+
++ 2 /
+
+"""
+
+# s = """
+# 440 128 sine
+# 449 128 sine
+# + 2 /
+# """
+
+
 def tokenize(program: str):
     tokens = list()
     
@@ -237,26 +336,37 @@ def parse_list(tokens: list, env: dict):
     l = list()
     while (token := tokens.pop(0)) != "]":
         if token.isnumeric():
-            l.append(float(token))
-        elif token.startswith("'"):
-            l.append(env["vars"].get(token, 0))
+            try:
+                l.append(int(token))
+            except ValueError:
+                l.append(float(token))
         else:
             raise Exception(f"Non valido per lista: {token}")
     return l
 
 
 def optimize_tokens(tokens: list):
-    out_tokens = list()
-    i = 0
+    list_optimizers = [
+        mtf_optcheck,
+        env_asr_optcheck, sine_wave_optcheck
+    ]
 
-    while i < len(tokens):
-        special_sub, increment = sine_wave_optcheck(tokens[i:])
-        if special_sub is None:
-            out_tokens.append(tokens[i])
-            i += 1
-        else:
-            out_tokens.append(special_sub)
-            i += increment
+    for optimizer in list_optimizers:
+        out_tokens = list()
+        i = 0
+
+        while i < len(tokens):
+            special_sub, increment = optimizer(tokens[i:])
+            if special_sub is None:
+                out_tokens.append(tokens[i])
+                i += 1
+            else:
+                out_tokens.append(special_sub)
+                i += increment
+
+        tokens = out_tokens
+
+    return out_tokens
 
     # =========================================================== #
     
@@ -295,19 +405,17 @@ def compiler(program: str, env: dict):
     while len(tokens) > 0:
         token = tokens.pop(0)
         unique_id += 1
-        
-        if isinstance(token, Const):
-            funcall = token.funcall
-            args    = token.args
-            
-            def inner(frame, env, stack, funcall=funcall, args=args):
-                stack.append(funcall(frame, *args))
-            test_out.append(inner)
 
-        elif isinstance(token, Callable):
+        if isinstance(token, Callable):
             test_out.append(token)
             
         elif token.isnumeric():
+            v = int(token)
+            def inner(frame, env, stack, val=v):
+                stack.append(val)
+            test_out.append(inner)
+
+        elif token.replace(".", "").isnumeric():
             v = float(token)
             def inner(frame, env, stack, val=v):
                 stack.append(val)
@@ -396,13 +504,21 @@ def compiler(program: str, env: dict):
                 stack.append(env.variables[name_id])
             test_out.append(inner)
 
-        elif token == "countTo":
+        elif token == "count_to":
             def inner(frame, env, stack):    
                 up_to = stack.pop()
-                bps   = stack.pop()
-                stack.append(count_to(frame, FRAMES_PER_SECOND // bps , up_to))
+                start = stack.pop()
+                trigger = stack.pop()
+                if trigger == 1:
+                    print(f"counter {trigger} {start} {up_to}")
+                stack.append(count_to(frame, trigger, start, up_to))
             test_out.append(inner)
-            
+
+        elif token == "dup":
+            def inner(frame, env, stack):
+                stack.append(stack[-1])
+            test_out.append(inner)
+
         elif token == "mtf":
             def inner(frame, env, stack):    
                 stack.append(mtf(frame, stack.pop()))
